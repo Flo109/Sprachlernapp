@@ -1,4 +1,4 @@
-const V = 'kurmanci-v3';
+const V = 'kurmanci-v4';
 const ASSETS = ['./', './index.html', './app.js', './style.css', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(ASSETS))); self.skipWaiting(); });
 self.addEventListener('activate', e => {

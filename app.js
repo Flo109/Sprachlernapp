@@ -63,7 +63,7 @@ const setMeta = (k, v) => reqP(store('meta', 'readwrite').put(v, k));
 function keysOf(c) { const p = c.type === 'word' ? '' : 'p:'; return [p + deKey(c.de), p + kuKey(c.ku)]; }
 function indexCard(c) {
   S.cards.set(c.id, c);
-  c._s = fold(c.de + ' | ' + c.ku);
+  c._s = fold((c.de || '') + ' | ' + (c.ku || '') + ' | ' + (c.input || ''));
   const [a, b] = keysOf(c);
   if (deKey(c.de)) S.byDe.set(a, c.id);
   if (kuKey(c.ku)) S.byKu.set(b, c.id);
@@ -139,7 +139,9 @@ document.addEventListener('pointerdown', e => {
 });
 const lvlBadge = l => `<span class="lvl" style="--h:${10 + l * 17}">${l}</span>`;
 function cardRow(c) {
-  return `<div class="crow" data-id="${c.id}"><div class="txt"><div class="c-de">${esc(c.de)}</div><div class="c-ku">${esc(c.ku)}</div>${c.type === 'phrase' ? '<div class="tag">Satz/Wendung</div>' : ''}</div>${lvlBadge(cardLevel(c))}</div>`;
+  if (c.pending) return `<div class="crow" data-id="${c.id}"><div class="txt"><div class="c-de">${esc(c.input)}</div><div class="c-ku" style="color:var(--muted)">⏳ wird übersetzt …</div></div></div>`;
+  const tags = [c.type === 'phrase' ? 'Satz/Wendung' : '', c.quality === 'google' ? (c.improve ? 'Google-Übersetzung · KI verbessert später' : 'Google-Übersetzung') : ''].filter(Boolean).join(' · ');
+  return `<div class="crow" data-id="${c.id}"><div class="txt"><div class="c-de">${esc(c.de)}</div><div class="c-ku">${esc(c.ku)}</div>${tags ? `<div class="tag">${tags}</div>` : ''}</div>${lvlBadge(cardLevel(c))}</div>`;
 }
 function bindRows(el, after) {
   el.querySelectorAll('.crow').forEach(r => (r.onclick = () => openEdit(S.cards.get(+r.dataset.id), after)));
@@ -205,13 +207,25 @@ async function modelsFor(p) {
 async function callProvider(p, model, system, messages, maxTokens) {
   const key = S.settings.keys[p].trim();
   if (p === 'gemini') {
+    S.settings.noThink = S.settings.noThink || {};
+    const think = !model.startsWith('gemma') && !S.settings.noThink[model];
     const gemma = model.startsWith('gemma');
     const msgs = gemma ? [{ role: 'user', content: system + '\n\n' + messages[0].content }, ...messages.slice(1)] : messages;
     const j = await postJSON(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { 'x-goog-api-key': key }, {
       ...(gemma ? {} : { systemInstruction: { parts: [{ text: system }] } }),
       contents: msgs.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-      generationConfig: { maxOutputTokens: Math.max(maxTokens, 6000), temperature: 0.4, ...(gemma ? {} : { responseMimeType: 'application/json' }) }
-    }, 25000);
+      generationConfig: {
+        maxOutputTokens: Math.max(maxTokens, 6000), temperature: 0.4, ...(gemma ? {} : { responseMimeType: 'application/json' }),
+        ...(think ? { thinkingConfig: { thinkingLevel: 'minimal' } } : {}) // kaum "Nachdenken" → viel schneller
+      }
+    }, 20000).catch(e => {
+      if (think && e.status === 400 && /think/i.test(e.message)) { // Modell kennt die Einstellung nicht → ohne wiederholen
+        S.settings.noThink[model] = true; setMeta('settings', S.settings);
+        return null;
+      }
+      throw e;
+    });
+    if (j === null) return callProvider(p, model, system, messages, maxTokens);
     const cand = j.candidates?.[0];
     const t = (cand?.content?.parts || []).filter(x => !x.thought).map(x => x.text || '').join('');
     if (!t) throw new HttpErr(500, 'leere Antwort' + (cand?.finishReason ? ' (' + cand.finishReason + ')' : ''));
@@ -268,6 +282,18 @@ Regeln:
 - type "word": ein einzelnes Wort (ein deutsches Substantiv mit Artikel zählt als ein Wort). Gib beide Seiten in der Grundform an: deutsche Substantive mit bestimmtem Artikel (z.B. "der Hund"), Verben im Infinitiv; Kurmanji-Substantive in der unbestimmten Grundform (Rectus, ohne Ezafe), Verben im Infinitiv (z.B. "xwarin"). Bei mehreren gängigen Bedeutungen höchstens 2, getrennt durch " / ". "words" bleibt leer.
 - type "phrase": Satz oder Wendung. Übersetze natürlich und grammatisch korrekt. In "words" stehen alle bedeutungstragenden Wörter des Satzes (Substantive, Verben, Adjektive, Adverbien, Pronomen, wichtige Präpositionen) als Paare in der Grundform wie oben beschrieben – ohne Duplikate und ohne Eigennamen.`;
 
+const BATCH_SYS = TRANSLATE_SYS + `
+
+Du bekommst MEHRERE Eingaben als JSON-Liste [{"id":…,"text":…,"lang":…}]. Bearbeite jede Eingabe nach den Regeln oben und antworte mit EINEM JSON-Objekt:
+{"items":[{"id":…,"source":…,"type":…,"de":…,"ku":…,"words":[…]}, …]} – genau ein Eintrag pro Eingabe, mit derselben id.`;
+async function translateBatchAI(batch) {
+  const input = batch.map(c => ({ id: c.id, text: c.input || c.de || c.ku, lang: c.lang === 'de' ? 'Deutsch' : c.lang === 'ku' ? 'Kurmanji' : 'automatisch erkennen' }));
+  const j = await llm(BATCH_SYS, [{ role: 'user', content: JSON.stringify(input) }], 600 + 350 * batch.length,
+    t => { const j = parseJSON(t); if (!Array.isArray(j.items) || !j.items.length) throw new Error('unvollständig'); return j; });
+  const m = new Map();
+  for (const it of j.items) if (it && it.de && it.ku) m.set(+it.id, it);
+  return m;
+}
 async function translateAI(text, hint) {
   const h = hint === 'de' ? ' (Sprache: Deutsch)' : hint === 'ku' ? ' (Sprache: Kurmanji)' : '';
   const j = await llm(TRANSLATE_SYS, [{ role: 'user', content: `Eingabe${h}: ${text}` }], 1500, t => { const j = parseJSON(t); if (!j.de || !j.ku) throw new Error('unvollständig'); return j; });
@@ -306,6 +332,7 @@ function candidates() {
   ensureDaily();
   const now = Date.now(), seen = new Set(S.daily.seen), rev = [], nw = [];
   for (const c of S.cards.values()) {
+    if (c.pending) continue; // wird noch übersetzt
     const ok = d => !seen.has(c.id + ':' + other(d)); // Geschwister-Richtung am selben Tag nicht abfragen
     let best = null;
     for (const d of ['kd', 'dk']) {
@@ -492,17 +519,18 @@ function viewAdd(m) {
   m.innerHTML = `
     <div class="card">
       <div class="seg" id="a-lang">${[['auto', 'Automatisch'], ['de', 'Deutsch'], ['ku', 'Kurmancî']].map(([k, l]) => `<button data-l="${k}" class="${k === addLang ? 'on' : ''}">${l}</button>`).join('')}</div>
-      <textarea id="a-in" rows="2" ${NOAC} placeholder="Wort, Satz oder Wendung auf Deutsch oder Kurmancî"></textarea>
+      <textarea id="a-in" rows="2" ${NOAC} placeholder="Wort oder Satz eingeben, Enter drücken, weitertippen …"></textarea>
       ${charBar('a-in')}
-      <div class="row"><button class="btn ghost" id="a-manual">Manuell</button><button class="btn" id="a-go">Übersetzen</button></div>
-      ${hasAI() ? '' : '<p class="hint">Ohne KI-Schlüssel wird Google Übersetzer genutzt; Wörter aus Sätzen werden dann nicht in die Grundform gebracht. Ein kostenloser Schlüssel verbessert das: <a href="#" id="a-set">Einstellungen</a></p>'}
+      <div class="row"><button class="btn ghost" id="a-manual">Selbst übersetzen</button><button class="btn" id="a-go">Hinzufügen</button></div>
+      <p class="hint">Die Karte wird sofort gespeichert und im Hintergrund übersetzt – du kannst direkt die nächste eingeben. Mehrere Zeilen einfügen = mehrere Karten. Tippe eine Karte unten an, um die Übersetzung zu prüfen oder zu korrigieren.${hasAI() ? '' : ' Ohne KI-Schlüssel wird Google Übersetzer genutzt (für Kurmancî oft ungenau): <a href="#" id="a-set">Einstellungen</a>'}</p>
     </div>
     <div id="a-out"></div>
     <div id="a-recent"></div>`;
   $$('#a-lang button').forEach(b => (b.onclick = () => { addLang = b.dataset.l; $$('#a-lang button').forEach(x => x.classList.toggle('on', x === b)); }));
   const inp = $('#a-in');
-  inp.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doTranslate(); } });
-  $('#a-go').onclick = doTranslate;
+  const go = () => { const t = inp.value; inp.value = ''; inp.focus(); addEntries(t); };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); } });
+  $('#a-go').onclick = go;
   $('#a-manual').onclick = () => {
     const t = inp.value.trim();
     renderPreview({ type: t.split(/\s+/).length > 2 ? 'phrase' : 'word', de: addLang === 'ku' ? '' : t, ku: addLang === 'ku' ? t : '', words: [] });
@@ -510,20 +538,77 @@ function viewAdd(m) {
   $('#a-set') && ($('#a-set').onclick = e => { e.preventDefault(); openSettings(); });
   renderRecent();
 }
-async function doTranslate() {
-  const text = $('#a-in').value.trim();
-  if (!text) return $('#a-in').focus();
-  const out = $('#a-out');
-  out.innerHTML = '<div class="card"><div class="spinner"></div></div>';
+async function addEntries(text) {
+  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return;
+  const created = Date.now();
+  const pendingInputs = new Set([...S.cards.values()].filter(c => c.pending).map(c => norm(c.input)));
+  let n = 0;
+  for (const line of lines) {
+    const type = line.split(/\s+/).length > 2 || /[.!?]/.test(line) ? 'phrase' : 'word';
+    const dup = findDup(line, line, type);
+    if (dup) { toast(`„${line}“ gibt es schon: ${dup.de} = ${dup.ku}`, 3500); continue; }
+    if (pendingInputs.has(norm(line))) continue;
+    pendingInputs.add(norm(line));
+    await saveCard({ ...makeCard('', '', type, created + n), pending: true, input: line, lang: addLang });
+    n++;
+  }
+  if (n) { persist(); renderRecent(); scheduleWorker(lines.length > 1 ? 300 : 1500); }
+}
+
+/* Hintergrund-Übersetzung: sammelt neue Karten und übersetzt sie gebündelt */
+let workerBusy = false, workerTimer = null, aiPauseUntil = 0, workerError = '';
+function scheduleWorker(ms = 1500) { clearTimeout(workerTimer); workerTimer = setTimeout(runWorker, ms); }
+async function runWorker() {
+  if (workerBusy) return scheduleWorker(2000);
+  workerBusy = true;
   try {
-    let res;
-    if (hasAI()) {
-      try { res = await translateAI(text, addLang); }
-      catch (e) { toast(e.message + ' → Google Übersetzer wird genutzt', 4500); res = await translateGoogle(text, addLang); }
-    } else res = await translateGoogle(text, addLang);
-    renderPreview(res);
-  } catch (e) {
-    out.innerHTML = `<div class="card"><p>⚠ ${esc(e.message)}</p><p class="hint">Du kannst die Karte auch über „Manuell“ selbst ausfüllen.</p></div>`;
+    for (let round = 0; round < 50; round++) {
+      const now = Date.now(), aiOk = hasAI() && now > aiPauseUntil;
+      const all = [...S.cards.values()];
+      const pend = all.filter(c => c.pending && !(c.nextTry > now));
+      const impr = aiOk ? all.filter(c => !c.pending && c.improve && !(c.nextTry > now)) : [];
+      const batch = [...pend, ...impr].slice(0, 12);
+      if (!batch.length) break;
+      let res = null;
+      if (aiOk) {
+        try { res = await translateBatchAI(batch); workerError = ''; }
+        catch (e) { aiPauseUntil = Date.now() + 10 * 60000; workerError = e.message; }
+      }
+      for (const c of batch) {
+        if (!S.cards.has(c.id)) continue; // inzwischen gelöscht
+        if (!c.pending && !c.improve) continue; // inzwischen von Hand bearbeitet
+        let r = res && res.get(c.id), quality = 'ai';
+        if (!r && c.pending) {
+          try { r = await translateGoogle(c.input, c.lang); quality = 'google'; }
+          catch (e) { workerError = e.message; }
+        }
+        if (r) await applyResult(c, r, quality);
+        else { c.tries = (c.tries || 0) + 1; c.nextTry = Date.now() + Math.min(60, 2 * c.tries) * 60000; await saveCard(c); }
+      }
+      if (current === 'add') renderRecent();
+    }
+  } finally { workerBusy = false; if (current === 'add') renderRecent(); }
+}
+async function applyResult(c, r, quality) {
+  const wasPending = !!c.pending;
+  unindexCard(c);
+  c.de = String(r.de || '').trim(); c.ku = String(r.ku || '').trim();
+  if (wasPending) c.type = r.type === 'word' ? 'word' : 'phrase';
+  delete c.pending; delete c.tries; delete c.nextTry;
+  c.quality = quality; c.updated = Date.now();
+  if (quality === 'google' && hasAI()) c.improve = true; else delete c.improve;
+  const dup = findDup(c.de, c.ku, c.type);
+  if (wasPending && dup && dup.id !== c.id) { await deleteCard(c); toast(`„${dup.de} = ${dup.ku}“ gibt es schon`); return; }
+  await saveCard(c);
+  if (!wasPending) return;
+  const src = r.source === 'ku' ? 'ku' : 'de';
+  for (const w of (Array.isArray(r.words) ? r.words : [])) {
+    const de = String(w.de || '').trim(), ku = String(w.ku || '').trim();
+    if (!de || !ku || findDup(de, ku, 'word')) continue;
+    const wc = { ...makeCard(de, ku, 'word', c.created), quality, input: src === 'ku' ? ku : de, lang: src };
+    if (quality === 'google' && hasAI()) wc.improve = true;
+    await saveCard(wc);
   }
 }
 function renderPreview(res) {
@@ -559,7 +644,7 @@ function renderPreview(res) {
     if (!de || !ku) return toast('Bitte beide Seiten ausfüllen');
     if (findDup(de, ku, type) && !confirmDup) { confirmDup = true; $('#p-save').textContent = 'Trotzdem speichern'; return; }
     const created = Date.now();
-    await saveCard(makeCard(de, ku, type, created));
+    await saveCard({ ...makeCard(de, ku, type, created), quality: 'manual' });
     let n = 0;
     for (const r of $$('.wrow', out)) {
       if (!r.querySelector('input[type=checkbox]').checked) continue;
@@ -573,8 +658,12 @@ function renderPreview(res) {
 }
 function renderRecent() {
   const el = $('#a-recent'); if (!el) return;
-  const list = Array.from(S.cards.values()).slice(-8).reverse();
-  el.innerHTML = list.length ? `<h3 class="lvl-h">Zuletzt hinzugefügt</h3>${list.map(cardRow).join('')}` : '';
+  const arr = Array.from(S.cards.values());
+  const list = arr.slice(-15).reverse();
+  const np = arr.filter(c => c.pending).length;
+  const status = np ? `<p class="hint">⏳ ${np} Karte${np > 1 ? 'n werden' : ' wird'} übersetzt …${workerError ? '<br>⚠ ' + esc(workerError) : ''}</p>`
+    : workerError ? `<p class="hint">⚠ ${esc(workerError)}</p>` : '';
+  el.innerHTML = list.length ? `<h3 class="lvl-h">Zuletzt hinzugefügt</h3>${status}${list.map(cardRow).join('')}` : '';
   bindRows(el, renderRecent);
 }
 
@@ -637,8 +726,8 @@ function dueText(s) {
 function openEdit(c, after) {
   if (!c) return;
   modal(`<h2>Karte bearbeiten</h2>
-    <label>Deutsch</label><textarea id="e-de" rows="2">${esc(c.de)}</textarea>
-    <label>Kurmancî</label><textarea id="e-ku" rows="2" ${NOAC}>${esc(c.ku)}</textarea>${charBar('e-ku')}
+    <label>Deutsch</label><textarea id="e-de" rows="2">${esc(c.de || (c.pending && c.lang !== 'ku' ? c.input : ''))}</textarea>
+    <label>Kurmancî</label><textarea id="e-ku" rows="2" ${NOAC}>${esc(c.ku || (c.pending && c.lang === 'ku' ? c.input : ''))}</textarea>${charBar('e-ku')}
     <label>Typ</label><select id="e-type"><option value="word">Wort</option><option value="phrase">Satz / Wendung</option></select>
     <div class="srsinfo">Deutsch → Kurmancî: <b>Stufe ${c.dk.lvl}</b> · ${dueText(c.dk)}<br>Kurmancî → Deutsch: <b>Stufe ${c.kd.lvl}</b> · ${dueText(c.kd)}<br>
       <small>Erstellt am ${fmtDate(c.created)} · Fehler insgesamt: ${c.dk.lapses + c.kd.lapses}</small></div>
@@ -651,7 +740,8 @@ function openEdit(c, after) {
         const de = $('#e-de', sh).value.trim(), ku = $('#e-ku', sh).value.trim();
         if (!de || !ku) return toast('Bitte beide Seiten ausfüllen');
         unindexCard(c);
-        Object.assign(c, { de, ku, type: $('#e-type', sh).value, updated: Date.now() });
+        Object.assign(c, { de, ku, type: $('#e-type', sh).value, updated: Date.now(), quality: 'manual' });
+        delete c.pending; delete c.improve; delete c.tries; delete c.nextTry;
         await saveCard(c);
         closeModal(); toast('Gespeichert'); after && after();
       };
@@ -821,6 +911,8 @@ function readKeys(sh) {
   for (const p of ORDER) keys[p] = $('#k-' + p, sh).value.trim();
   for (const p of ORDER) if (keys[p] !== S.settings.keys[p]) delete S.settings.models[p];
   S.settings.keys = keys;
+  if (hasAI()) for (const c of S.cards.values()) if (c.quality === 'google' && !c.improve) { c.improve = true; saveCard(c); }
+  scheduleWorker(500);
 }
 async function testProviders(out) {
   const lines = [];
@@ -938,7 +1030,9 @@ function show(view) {
   catch (e) { $('#main').innerHTML = `<div class="card">Fehler beim Öffnen der Datenbank: ${esc(e.message)}</div>`; return; }
   $$('.tabs button').forEach(b => (b.onclick = () => show(b.dataset.v)));
   $('#btn-settings').onclick = openSettings;
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && current === 'learn' && !sess) show('learn'); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { scheduleWorker(1000); if (current === 'learn' && !sess) show('learn'); } });
+  setInterval(() => scheduleWorker(0), 5 * 60000);
+  scheduleWorker(2000);
   show('learn');
   persist();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
